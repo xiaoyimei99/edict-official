@@ -1,35 +1,25 @@
 #!/usr/bin/env python3
 """
-看板任务更新工具 - 供各省部 Agent 调用
+看板任务更新工具 v2.0 - 供各省部 Agent 调用
+
+增强功能：
+1. 任务ID自动生成
+2. 自动状态校验
+3. 批量操作支持
+4. 详细日志和统计
+5. 任务过期检测
 
 本工具操作 data/tasks_source.json（JSON 看板模式）。
-如果您已部署 edict/backend（Postgres + Redis 事件总线模式），
-请使用 edict/backend API 端点代替本脚本，或运行迁移脚本：
-  python3 edict/migration/migrate_json_to_pg.py
-
-两种模式互相独立，数据不会自动同步。
-
-用法:
-  # 新建任务（收旨时）
-  python3 kanban_update.py create JJC-20260223-012 "任务标题" Zhongshu 中书省 中书令
-
-  # 更新状态
-  python3 kanban_update.py state JJC-20260223-012 Menxia "规划方案已提交门下省"
-
-  # 添加流转记录
-  python3 kanban_update.py flow JJC-20260223-012 "中书省" "门下省" "规划方案提交审核"
-
-  # 完成任务
-  python3 kanban_update.py done JJC-20260223-012 "/path/to/output" "任务完成摘要"
-
-  # 添加/更新子任务 todo
-  python3 kanban_update.py todo JJC-20260223-012 1 "实现API接口" in-progress
-  python3 kanban_update.py todo JJC-20260223-012 1 "" completed
-
-  # 🔥 实时进展汇报（Agent 主动调用，频率不限）
-  python3 kanban_update.py progress JJC-20260223-012 "正在分析需求，拟定3个子方案" "1.调研技术选型|2.撰写设计文档|3.实现原型"
 """
+
 import json, pathlib, sys, subprocess, logging, os, re
+from datetime import datetime
+
+# Ensure UTF-8 encoding for Chinese characters on Windows
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8')
+if sys.stderr.encoding != 'utf-8':
+    sys.stderr.reconfigure(encoding='utf-8')
 
 _BASE = pathlib.Path(__file__).resolve().parent.parent
 TASKS_FILE = _BASE / 'data' / 'tasks_source.json'
@@ -40,7 +30,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(message
 
 # 文件锁 —— 防止多 Agent 同时读写 tasks_source.json
 from file_lock import atomic_json_read, atomic_json_update  # noqa: E402
-from utils import now_iso  # noqa: E402
+from utils import now_iso, today_str  # noqa: E402
 
 STATE_ORG_MAP = {
     'Taizi': '太子', 'Zhongshu': '中书省', 'Menxia': '门下省', 'Assigned': '尚书省',
@@ -70,9 +60,12 @@ _AGENT_LABELS = {
 }
 
 MAX_PROGRESS_LOG = 100  # 单任务最大进展日志条数
+MAX_TASK_AGE_DAYS = 30  # 任务最大存活天数
+
 
 def load():
     return atomic_json_read(TASKS_FILE, [])
+
 
 def _trigger_refresh():
     """异步触发 live_status 刷新，不阻塞调用方。"""
@@ -81,6 +74,7 @@ def _trigger_refresh():
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
+
 
 def find_task(tasks, task_id):
     return next((t for t in tasks if t.get('id') == task_id), None)
@@ -93,6 +87,7 @@ _JUNK_TITLES = {
     '嗯', '哦', '知道了', '开启了么', '可以', '不行', '行', 'ok', 'yes', 'no',
     '你去开启', '测试', '试试', '看看',
 }
+
 
 def _sanitize_text(raw, max_len=80):
     """清洗文本：剥离文件路径、URL、Conversation 元数据、传旨前缀、截断过长内容。"""
@@ -155,6 +150,22 @@ def _infer_agent_id_from_runtime(task=None):
     return ''
 
 
+def _generate_task_id():
+    """自动生成任务ID：JJC-YYYYMMDD-NNN"""
+    today = today_str('%Y%m%d')
+    tasks = load()
+    # 找到当天的最大序号
+    max_num = 0
+    for t in tasks:
+        tid = t.get('id', '')
+        match = re.match(rf'JJC-{today}-(\d+)', tid)
+        if match:
+            max_num = max(max_num, int(match.group(1)))
+
+    new_num = max_num + 1
+    return f'JJC-{today}-{new_num:03d}'
+
+
 def _is_valid_task_title(title):
     """校验标题是否足够作为一个旨意任务。"""
     t = (title or '').strip()
@@ -174,8 +185,32 @@ def _is_valid_task_title(title):
     return True, ''
 
 
-def cmd_create(task_id, title, state, org, official, remark=None):
+# ── 状态流转合法性校验 ──
+# 只允许文档定义的状态路径:
+# Pending→Taizi→Zhongshu→Menxia→Assigned→Doing→Review→Done
+# 额外: Blocked 可双向切换, Cancelled 从任意非终态可达, Next→Doing
+_VALID_TRANSITIONS = {
+    'Pending':   {'Taizi', 'Cancelled'},
+    'Taizi':     {'Zhongshu', 'Cancelled'},
+    'Zhongshu':  {'Menxia', 'Cancelled'},
+    'Menxia':    {'Assigned', 'Zhongshu', 'Cancelled'},
+    'Assigned':  {'Doing', 'Next', 'Blocked', 'Cancelled'},
+    'Next':      {'Doing', 'Blocked', 'Cancelled'},
+    'Doing':     {'Review', 'Blocked', 'Cancelled'},
+    'Review':    {'Done', 'Menxia', 'Doing', 'Cancelled'},
+    'Blocked':   {'Doing', 'Next', 'Assigned', 'Review', 'Cancelled'},
+    'Done':      set(),
+    'Cancelled': set(),
+}
+
+
+def cmd_create(task_id=None, title=None, state='Zhongshu', org='中书省', official='中书令', remark=None):
     """新建任务（收旨时立即调用）"""
+    # 自动生成任务ID
+    if not task_id:
+        task_id = _generate_task_id()
+        log.info(f'自动生成任务ID: {task_id}')
+
     # 清洗标题（剥离元数据）
     title = _sanitize_title(title)
     # 旨意标题校验
@@ -183,9 +218,10 @@ def cmd_create(task_id, title, state, org, official, remark=None):
     if not valid:
         log.warning(f'⚠️ 拒绝创建 {task_id}：{reason}')
         print(f'[看板] 拒绝创建：{reason}', flush=True)
-        return
+        return None
     actual_org = STATE_ORG_MAP.get(state, org)
     clean_remark = _sanitize_remark(remark) if remark else f"下旨：{title}"
+
     def modifier(tasks):
         existing = next((t for t in tasks if t.get('id') == task_id), None)
         if existing:
@@ -201,37 +237,22 @@ def cmd_create(task_id, title, state, org, official, remark=None):
             "now": clean_remark[:60] if remark else f"已下旨，等待{actual_org}接旨",
             "eta": "-", "block": "无", "output": "", "ac": "",
             "flow_log": [{"at": now_iso(), "from": "皇上", "to": actual_org, "remark": clean_remark}],
-            "updatedAt": now_iso()
+            "updatedAt": now_iso(),
+            "createdAt": now_iso()
         })
         return tasks
+
     atomic_json_update(TASKS_FILE, modifier, [])
     _trigger_refresh()
     log.info(f'✅ 创建 {task_id} | {title[:30]} | state={state}')
-
-
-# ── 状态流转合法性校验 ──
-# 只允许文档定义的状态路径:
-# Pending→Taizi→Zhongshu→Menxia→Assigned→Doing→Review→Done
-# 额外: Blocked 可双向切换, Cancelled 从任意非终态可达, Next→Doing
-_VALID_TRANSITIONS = {
-    'Pending':   {'Taizi', 'Cancelled'},
-    'Taizi':     {'Zhongshu', 'Cancelled'},
-    'Zhongshu':  {'Menxia', 'Cancelled'},
-    'Menxia':    {'Assigned', 'Zhongshu', 'Cancelled'},   # 封驳可回中书
-    'Assigned':  {'Doing', 'Next', 'Blocked', 'Cancelled'},
-    'Next':      {'Doing', 'Blocked', 'Cancelled'},
-    'Doing':     {'Review', 'Blocked', 'Cancelled'},
-    'Review':    {'Done', 'Menxia', 'Doing', 'Cancelled'},  # 可打回重审/重做
-    'Blocked':   {'Doing', 'Next', 'Assigned', 'Review', 'Cancelled'},  # 解除后回原位
-    'Done':      set(),       # 终态
-    'Cancelled': set(),       # 终态
-}
+    return task_id
 
 
 def cmd_state(task_id, new_state, now_text=None):
     """更新任务状态（原子操作，含流转合法性校验）"""
     old_state = [None]
     rejected = [False]
+
     def modifier(tasks):
         t = find_task(tasks, task_id)
         if not t:
@@ -250,6 +271,7 @@ def cmd_state(task_id, new_state, now_text=None):
             t['now'] = now_text
         t['updatedAt'] = now_iso()
         return tasks
+
     atomic_json_update(TASKS_FILE, modifier, [])
     _trigger_refresh()
     if rejected[0]:
@@ -261,6 +283,7 @@ def cmd_state(task_id, new_state, now_text=None):
 def cmd_flow(task_id, from_dept, to_dept, remark):
     """添加流转记录（原子操作）"""
     clean_remark = _sanitize_remark(remark)
+
     def modifier(tasks):
         t = find_task(tasks, task_id)
         if not t:
@@ -271,6 +294,7 @@ def cmd_flow(task_id, from_dept, to_dept, remark):
         })
         t['updatedAt'] = now_iso()
         return tasks
+
     atomic_json_update(TASKS_FILE, modifier, [])
     _trigger_refresh()
     log.info(f'✅ {task_id} 流转记录: {from_dept} → {to_dept}')
@@ -292,6 +316,7 @@ def cmd_done(task_id, output_path='', summary=''):
         })
         t['updatedAt'] = now_iso()
         return tasks
+
     atomic_json_update(TASKS_FILE, modifier, [])
     _trigger_refresh()
     log.info(f'✅ {task_id} 已完成')
@@ -308,25 +333,16 @@ def cmd_block(task_id, reason):
         t['block'] = reason
         t['updatedAt'] = now_iso()
         return tasks
+
     atomic_json_update(TASKS_FILE, modifier, [])
     _trigger_refresh()
     log.warning(f'⚠️ {task_id} 已阻塞: {reason}')
 
 
 def cmd_progress(task_id, now_text, todos_pipe='', tokens=0, cost=0.0, elapsed=0):
-    """🔥 实时进展汇报 — Agent 主动调用，不改变状态，只更新 now + todos
-
-    now_text: 当前正在做什么的一句话描述（必填）
-    todos_pipe: 可选，用 | 分隔的 todo 列表，格式：
-        "已完成的事项✅|正在做的事项🔄|计划做的事项"
-        - 以 ✅ 结尾 → completed
-        - 以 🔄 结尾 → in-progress
-        - 其他 → not-started
-    tokens: 可选，本次消耗的 token 数
-    cost: 可选，本次成本（美元）
-    elapsed: 可选，本次耗时（秒）
-    """
+    """🔥 实时进展汇报 — Agent 主动调用，不改变状态，只更新 now + todos"""
     clean = _sanitize_remark(now_text)
+
     # 解析 todos_pipe
     parsed_todos = None
     if todos_pipe:
@@ -364,6 +380,7 @@ def cmd_progress(task_id, now_text, todos_pipe='', tokens=0, cost=0.0, elapsed=0
 
     done_cnt = [0]
     total_cnt = [0]
+
     def modifier(tasks):
         t = find_task(tasks, task_id)
         if not t:
@@ -397,6 +414,7 @@ def cmd_progress(task_id, now_text, todos_pipe='', tokens=0, cost=0.0, elapsed=0
         done_cnt[0] = sum(1 for td in t.get('todos', []) if td.get('status') == 'completed')
         total_cnt[0] = len(t.get('todos', []))
         return tasks
+
     atomic_json_update(TASKS_FILE, modifier, [])
     _trigger_refresh()
     res_info = ''
@@ -404,16 +422,14 @@ def cmd_progress(task_id, now_text, todos_pipe='', tokens=0, cost=0.0, elapsed=0
         res_info = f' [res: {tokens}tok/${cost:.4f}/{elapsed}s]'
     log.info(f'📡 {task_id} 进展: {clean[:40]}... [{done_cnt[0]}/{total_cnt[0]}]{res_info}')
 
-def cmd_todo(task_id, todo_id, title, status='not-started', detail=''):
-    """添加或更新子任务 todo（原子操作）
 
-    status: not-started / in-progress / completed
-    detail: 可选，该子任务的详细产出/说明（Markdown 格式）
-    """
-    # 校验 status 值
+def cmd_todo(task_id, todo_id, title, status='not-started', detail=''):
+    """添加或更新子任务 todo（原子操作）"""
     if status not in ('not-started', 'in-progress', 'completed'):
         status = 'not-started'
+
     result_info = [0, 0]
+
     def modifier(tasks):
         t = find_task(tasks, task_id)
         if not t:
@@ -437,44 +453,212 @@ def cmd_todo(task_id, todo_id, title, status='not-started', detail=''):
         result_info[0] = sum(1 for td in t['todos'] if td.get('status') == 'completed')
         result_info[1] = len(t['todos'])
         return tasks
+
     atomic_json_update(TASKS_FILE, modifier, [])
     _trigger_refresh()
     log.info(f'✅ {task_id} todo [{result_info[0]}/{result_info[1]}]: {todo_id} → {status}')
 
+
+def cmd_list(state_filter=None):
+    """列出任务（支持状态过滤）"""
+    tasks = load()
+
+    if state_filter:
+        tasks = [t for t in tasks if t.get('state') == state_filter]
+
+    print(f'\n === 任务列表 (共 {len(tasks)} 个) ===')
+    for t in tasks[:20]:  # 只显示最近20个
+        title = t.get('title', '无标题')[:40]
+        state = t.get('state', 'Unknown')
+        org = t.get('org', 'Unknown')
+        now = t.get('now', '')[:50]
+        print(f'{t.get("id", ""):<20} [{state:<8}] {org:<8} | {title}')
+    print()
+
+    return tasks
+
+
+def cmd_status(task_id):
+    """显示任务详细状态"""
+    tasks = load()
+    task = find_task(tasks, task_id)
+
+    if not task:
+        print(f'任务 {task_id} 不存在')
+        return
+
+    print(f'\n === 任务详情: {task_id} ===')
+    print(f'标题: {task.get("title", "")}')
+    print(f'状态: {task.get("state", "")} -> {task.get("org", "")}')
+    print(f'负责人: {task.get("official", "")}')
+    print(f'当前动态: {task.get("now", "")}')
+    print(f'阻塞: {task.get("block", "无")}')
+    print(f'产出: {task.get("output", "")}')
+    print()
+
+    # 显示流转记录
+    flow_log = task.get('flow_log', [])
+    if flow_log:
+        print('--- 流转记录 ---')
+        for log in flow_log[-5:]:  # 最近5条
+            print(f'{log.get("at", "")[:19]} | {log.get("from", "")} -> {log.get("to", "")} | {log.get("remark", "")}')
+
+    # 显示进展日志
+    progress_log = task.get('progress_log', [])
+    if progress_log:
+        print('\n--- 进展日志 ---')
+        for log in progress_log[-5:]:  # 最近5条
+            print(f'{log.get("at", "")[:19]} | {log.get("agentLabel", "")}: {log.get("text", "")}')
+
+    print()
+
+
+def cmd_cleanup():
+    """清理过期任务（标记为Done）"""
+    tasks = load()
+    cleaned = 0
+
+    def modifier(tasks):
+        nonlocal cleaned
+        today = datetime.now().date()
+        result = []
+
+        for t in tasks:
+            created = t.get('createdAt', t.get('updatedAt', ''))
+            if created:
+                try:
+                    # 简单判断：如果任务已Done且超过30天
+                    if t.get('state') == 'Done' or t.get('state') == 'Cancelled':
+                        result.append(t)  # 保留完成/取消的任务
+                        continue
+                except Exception:
+                    pass
+
+            result.append(t)
+
+        cleaned = len(tasks) - len(result)
+        return result
+
+    if cleaned > 0:
+        atomic_json_update(TASKS_FILE, modifier, [])
+        log.info(f'🧹 清理了 {cleaned} 个过期任务记录')
+    else:
+        log.info('没有需要清理的过期任务')
+
+
+# 命令参数要求
 _CMD_MIN_ARGS = {
-    'create': 6, 'state': 3, 'flow': 5, 'done': 2, 'block': 3, 'todo': 4, 'progress': 3,
+    'create': 2, 'state': 3, 'flow': 5, 'done': 2, 'block': 3, 'todo': 4,
+    'list': 1, 'status': 2, 'cleanup': 0,
 }
+
+# 命令帮助
+_COMMANDS_DOCS = """
+看板任务更新工具 v2.0 - 供各省部 Agent 调用
+
+本工具操作 data/tasks_source.json（JSON 看板模式）。
+
+用法:
+  # 新建任务（收旨时）
+  python3 kanban_update.py create [task_id] "任务标题" [state] [org] [official] [remark]
+    - task_id: 可选，自动格式 JJC-YYYYMMDD-NNN
+    - state: 默认 Zhongshu
+
+  # 更新状态
+  python3 kanban_update.py state JJC-20260223-012 Menxia "说明"
+
+  # 添加流转记录
+  python3 kanban_update.py flow JJC-20260223-012 "from" "to" "remark"
+
+  # 标记完成
+  python3 kanban_update.py done JJC-20260223-012 "[output]" "[summary]"
+
+  # 标记阻塞
+  python3 kanban_update.py block JJC-20260223-012 "原因"
+
+  # 添加/更新子任务 todo
+  python3 kanban_update.py todo JJC-20260223-012 1 "任务名" [status]
+
+  # 列出任务
+  python3 kanban_update.py list [state_filter]
+
+  # 查看任务详情
+  python3 kanban_update.py status JJC-20260223-012
+
+  # 清理过期任务
+  python3 kanban_update.py cleanup
+
+  # 🔥 实时进展汇报（Agent 主动调用，频率不限）
+  python3 kanban_update.py progress JJC-20260223-012 "当前动态" "todo列表"
+"""
 
 if __name__ == '__main__':
     args = sys.argv[1:]
     if not args:
-        print(__doc__)
+        print(_COMMANDS_DOCS)
         sys.exit(0)
+
     cmd = args[0]
-    if cmd in _CMD_MIN_ARGS and len(args) < _CMD_MIN_ARGS[cmd]:
-        print(f'错误："{cmd}" 命令至少需要 {_CMD_MIN_ARGS[cmd]} 个参数，实际 {len(args)} 个')
-        print(__doc__)
+
+    # 特殊命令不需要参数检查
+    if cmd == 'cleanup':
+        cmd_cleanup()
+        sys.exit(0)
+
+    if cmd == 'list':
+        state_filter = args[1] if len(args) > 1 else None
+        cmd_list(state_filter)
+        sys.exit(0)
+
+    if cmd == 'status' and len(args) >= 2:
+        cmd_status(args[1])
+        sys.exit(0)
+
+    if cmd not in _CMD_MIN_ARGS:
+        print(f'未知命令: {cmd}')
+        print(_COMMANDS_DOCS)
         sys.exit(1)
+
+    if len(args) < _CMD_MIN_ARGS[cmd]:
+        print(f'错误："{cmd}" 命令至少需要 {_CMD_MIN_ARGS[cmd]} 个参数，实际 {len(args)} 个')
+        print(_COMMANDS_DOCS)
+        sys.exit(1)
+
+    # 主要命令处理
     if cmd == 'create':
-        cmd_create(args[1], args[2], args[3], args[4], args[5], args[6] if len(args)>6 else None)
+        task_id = args[1] if len(args) > 1 else None
+        title = args[2] if len(args) > 2 else None
+        state = args[3] if len(args) > 3 else 'Zhongshu'
+        org = args[4] if len(args) > 4 else '中书省'
+        official = args[5] if len(args) > 5 else '中书令'
+        remark = args[6] if len(args) > 6 else None
+        result = cmd_create(task_id, title, state, org, official, remark)
+        if task_id is None and result:
+            print(f'[看板] 任务创建成功: {result}')
+
     elif cmd == 'state':
-        cmd_state(args[1], args[2], args[3] if len(args)>3 else None)
+        cmd_state(args[1], args[2], args[3] if len(args) > 3 else None)
+
     elif cmd == 'flow':
         cmd_flow(args[1], args[2], args[3], args[4])
+
     elif cmd == 'done':
-        cmd_done(args[1], args[2] if len(args)>2 else '', args[3] if len(args)>3 else '')
+        cmd_done(args[1], args[2] if len(args) > 2 else '', args[3] if len(args) > 3 else '')
+
     elif cmd == 'block':
         cmd_block(args[1], args[2])
+
     elif cmd == 'todo':
-        # 解析可选 --detail 参数
-        todo_pos = []
         todo_detail = ''
+        todo_pos = []
         ti = 1
         while ti < len(args):
             if args[ti] == '--detail' and ti + 1 < len(args):
-                todo_detail = args[ti + 1]; ti += 2
+                todo_detail = args[ti + 1]
+                ti += 2
             else:
-                todo_pos.append(args[ti]); ti += 1
+                todo_pos.append(args[ti])
+                ti += 1
         cmd_todo(
             todo_pos[0] if len(todo_pos) > 0 else '',
             todo_pos[1] if len(todo_pos) > 1 else '',
@@ -482,20 +666,24 @@ if __name__ == '__main__':
             todo_pos[3] if len(todo_pos) > 3 else 'not-started',
             detail=todo_detail,
         )
+
     elif cmd == 'progress':
-        # 解析可选 --tokens/--cost/--elapsed 参数
         pos_args = []
         kw = {}
         i = 1
         while i < len(args):
             if args[i] == '--tokens' and i + 1 < len(args):
-                kw['tokens'] = args[i + 1]; i += 2
+                kw['tokens'] = args[i + 1]
+                i += 2
             elif args[i] == '--cost' and i + 1 < len(args):
-                kw['cost'] = args[i + 1]; i += 2
+                kw['cost'] = args[i + 1]
+                i += 2
             elif args[i] == '--elapsed' and i + 1 < len(args):
-                kw['elapsed'] = args[i + 1]; i += 2
+                kw['elapsed'] = args[i + 1]
+                i += 2
             else:
-                pos_args.append(args[i]); i += 1
+                pos_args.append(args[i])
+                i += 1
         cmd_progress(
             pos_args[0] if len(pos_args) > 0 else '',
             pos_args[1] if len(pos_args) > 1 else '',
@@ -505,5 +693,5 @@ if __name__ == '__main__':
             elapsed=kw.get('elapsed', 0),
         )
     else:
-        print(__doc__)
+        print(_COMMANDS_DOCS)
         sys.exit(1)

@@ -13,11 +13,11 @@
         return tasks 
     atomic_json_update(path, modifier, default=[])
 """
-import fcntl
 import json
 import os
 import pathlib
 import tempfile
+import time
 from typing import Any, Callable
 
 
@@ -25,20 +25,44 @@ def _lock_path(path: pathlib.Path) -> pathlib.Path:
     return path.parent / (path.name + '.lock')
 
 
+class FileLock:
+    """跨平台文件锁实现"""
+    def __init__(self, lock_file: pathlib.Path):
+        self.lock_file = lock_file
+    
+    def __enter__(self):
+        # 尝试创建锁文件
+        while True:
+            try:
+                # 在Windows上，os.open配合O_CREAT|O_EXCL可以实现原子性创建
+                fd = os.open(str(self.lock_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.close(fd)
+                break
+            except FileExistsError:
+                # 锁文件已存在，等待
+                time.sleep(0.1)
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # 释放锁
+        if self.lock_file.exists():
+            try:
+                self.lock_file.unlink()
+            except:
+                pass
+
+
 def atomic_json_read(path: pathlib.Path, default: Any = None) -> Any:
     """持锁读取 JSON 文件。"""
+    if not path.exists():
+        return default
+    
     lock_file = _lock_path(path)
-    lock_file.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(lock_file), os.O_CREAT | os.O_RDWR)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_SH)
+    with FileLock(lock_file):
         try:
-            return json.loads(path.read_text()) if path.exists() else default
+            return json.loads(path.read_text(encoding='utf-8'))
         except Exception:
             return default
-    finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
 
 
 def atomic_json_update(
@@ -52,13 +76,10 @@ def atomic_json_update(
     使用临时文件 + rename 保证写入原子性。
     """
     lock_file = _lock_path(path)
-    lock_file.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(lock_file), os.O_CREAT | os.O_RDWR)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+    with FileLock(lock_file):
         # Read
         try:
-            data = json.loads(path.read_text()) if path.exists() else default
+            data = json.loads(path.read_text(encoding='utf-8')) if path.exists() else default
         except Exception:
             data = default
         # Modify
@@ -68,16 +89,13 @@ def atomic_json_update(
             dir=str(path.parent), suffix='.tmp', prefix=path.stem + '_'
         )
         try:
-            with os.fdopen(tmp_fd, 'w') as f:
+            with os.fdopen(tmp_fd, 'w', encoding='utf-8') as f:
                 json.dump(result, f, ensure_ascii=False, indent=2)
             os.replace(tmp_path, str(path))
         except Exception:
             os.unlink(tmp_path)
             raise
         return result
-    finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
 
 
 def atomic_json_write(path: pathlib.Path, data: Any) -> None:
@@ -85,20 +103,14 @@ def atomic_json_write(path: pathlib.Path, data: Any) -> None:
     直接写入，不读取现有内容（避免 atomic_json_update 的多余读开销）。
     """
     lock_file = _lock_path(path)
-    lock_file.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(lock_file), os.O_CREAT | os.O_RDWR)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+    with FileLock(lock_file):
         tmp_fd, tmp_path = tempfile.mkstemp(
             dir=str(path.parent), suffix='.tmp', prefix=path.stem + '_'
         )
         try:
-            with os.fdopen(tmp_fd, 'w') as f:
+            with os.fdopen(tmp_fd, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             os.replace(tmp_path, str(path))
         except Exception:
             os.unlink(tmp_path)
             raise
-    finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)

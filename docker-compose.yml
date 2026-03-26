@@ -1,15 +1,35 @@
 version: '3.8'
 
 services:
-  sansheng-demo:
-    image: cft0808/sansheng-demo:latest
-    platform: linux/amd64
+  edict-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
     ports:
       - "7891:7891"
+    volumes:
+      # 挂载数据目录，方便更新
+      - ./dashboard/data:/app/data:ro
     environment:
-      - DEMO_MODE=true
+      - PYTHONUNBUFFERED=1
     restart: unless-stopped
-
-# 启动: docker compose up
-# 如果在 ARM Mac (M1/M2/M3) 上运行，删除 platform 行即可
-# 访问: http://localhost:7891
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:7891/healthz')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+  
+  # 前端开发服务器（可选）
+  edict-frontend:
+    image: node:20-alpine
+    working_dir: /app
+    volumes:
+      - ./edict/frontend:/app
+    ports:
+      - "5173:5173"
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    depends_on:
+      - edict-api
+    profiles:
+      - dev

@@ -2,28 +2,35 @@
 .git
 .gitignore
 
-# IDE / Editor
-.vscode
-.idea
-*.swp
-*.swo
-*~
-
 # Python
-__pycache__
-*.pyc
-*.pyo
-.mypy_cache
-.pytest_cache
-.venv
-venv
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
 
-# OS
+# Node
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# 测试
+tests/
+test_*.py
+*_test.py
+
+# 文档
+*.md
+docs/
+
+# 其他
+*.log
+.env
+.env.*
+*.bak
+*.swp
 .DS_Store
 Thumbs.db
-
-# Docs (not needed in image)
-docs/
-*.md
-!README.md
-LICENSE

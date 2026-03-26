@@ -110,7 +110,7 @@ def _collect_openclaw_models(cfg):
 def main():
     cfg = {}
     try:
-        cfg = json.loads(OPENCLAW_CFG.read_text())
+        cfg = json.loads(OPENCLAW_CFG.read_text(encoding='utf-8'))
     except Exception as e:
         log.warning(f'cannot read openclaw.json: {e}')
         return
