@@ -8,24 +8,25 @@ services:
     ports:
       - "7891:7891"
     volumes:
-      # 挂载数据目录，方便更新
-      - ./dashboard/data:/app/data:ro
+      # 挂载本地数据目录（实时同步）
+      - /c/Users/drx/.openclaw/edict-official/data:/app/data:ro
+      - /c/Users/drx/.openclaw/edict-official/scripts:/app/scripts:ro
     environment:
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:7891/healthz')"]
+      test: ["CMD", "curl", "-f", "http://localhost:7891/healthz"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 10s
-  
+
   # 前端开发服务器（可选）
   edict-frontend:
     image: node:20-alpine
     working_dir: /app
     volumes:
-      - ./edict/frontend:/app
+      - /c/Users/drx/.openclaw/edict-official/edict/frontend:/app
     ports:
       - "5173:5173"
     command: sh -c "npm install && npm run dev -- --host 0.0.0.0"

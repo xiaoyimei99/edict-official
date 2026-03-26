@@ -43,8 +43,18 @@ class SimpleAPIHandler(BaseHTTPRequestHandler):
             self.serve_api('', {'date': '', 'generated_at': '', 'categories': {}})
         elif path == '/api/morning-config':
             self.serve_api('', {'categories': [], 'keywords': [], 'custom_feeds': [], 'feishu_webhook': ''})
+        elif path == '/healthz':
+            self.send_health()
         else:
             self.send_error(404, 'Not Found')
+
+    def send_health(self):
+        """健康检查端点"""
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(b'{"status":"ok"}')
 
     def serve_file(self, filepath, mime_type):
         try:
