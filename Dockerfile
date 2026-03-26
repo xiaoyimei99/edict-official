@@ -18,14 +18,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN mkdir -p /app/scripts /app/data /app/dashboard
 
 # 复制必要的脚本文件
-COPY edict-official/scripts/file_lock.py ./scripts/
-COPY edict-official/scripts/utils.py ./scripts/
+COPY scripts/file_lock.py ./scripts/
+COPY scripts/utils.py ./scripts/
 
 # 复制数据目录
-COPY edict-official/data/ ./data/
+COPY dashboard/data/ ./data/
 
 # 复制服务器脚本
-COPY edict-official/dashboard/server.py ./
+COPY dashboard/server.py ./
 
 # 暴露端口
 EXPOSE 7891
