@@ -26,11 +26,14 @@ test_*.py
 *.md
 docs/
 
-# 其他
-*.log
-.env
-.env.*
-*.bak
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# IDE
+.vscode/
+.idea/
 *.swp
 .DS_Store
 Thumbs.db
